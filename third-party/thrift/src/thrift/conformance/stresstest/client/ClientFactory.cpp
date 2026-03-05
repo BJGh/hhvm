@@ -23,8 +23,8 @@
 #include <fizz/client/MultiClientExtensions.h>
 #include <folly/FileUtil.h>
 #include <folly/executors/IOThreadPoolExecutor.h>
-#include <folly/experimental/io/AsyncIoUringSocket.h>
-#include <folly/experimental/io/AsyncIoUringSocketFactory.h>
+#include <folly/io/async/AsyncIoUringSocket.h>
+#include <folly/io/async/AsyncIoUringSocketFactory.h>
 #include <folly/io/async/AsyncSSLSocket.h>
 #include <folly/io/async/AsyncSocket.h>
 #include <folly/io/async/IoUringBackend.h>
@@ -294,9 +294,10 @@ folly::AsyncTransport::UniquePtr createFizzSocket(
 }
 
 #if FOLLY_HAS_LIBURING
-folly::AsyncIoUringSocket::Options getIoUringSocketOptions() {
+folly::AsyncIoUringSocket::Options getIoUringSocketOptions(
+    const ClientConnectionConfig& cfg) {
   folly::AsyncIoUringSocket::Options opts;
-  if (FLAGS_io_zctx) {
+  if (cfg.ioUringZctx) {
     opts.zeroCopyEnable = [](auto&&) { return true; };
   }
   return opts;
@@ -304,10 +305,11 @@ folly::AsyncIoUringSocket::Options getIoUringSocketOptions() {
 
 folly::AsyncTransport::UniquePtr createIOUring(
     folly::EventBase* evb, const ClientConnectionConfig& cfg) {
-  auto ring = new folly::AsyncIoUringSocket(evb, getIoUringSocketOptions());
-  folly::NetworkSocket boundFd;
+  auto ring = new folly::AsyncIoUringSocket(evb, getIoUringSocketOptions(cfg));
+  folly::AsyncSocketTransport::BindOptions bindOptions =
+      folly::AsyncSocket::anyAddress();
   if (cfg.ioUringZcrx && cfg.ioUringZcrxSocketBind) {
-    boundFd = folly::AsyncIoUringSocketFactory::createBoundSocketForZcRx(
+    bindOptions = folly::AsyncIoUringSocketFactory::createBoundSocketForZcRx(
         evb, cfg.serverHost.getIPAddress(), cfg.serverHost.getPort());
   }
   ring->connect(
@@ -315,20 +317,19 @@ folly::AsyncTransport::UniquePtr createIOUring(
       cfg.serverHost,
       std::chrono::milliseconds(0),
       getSocketOptions(cfg),
-      folly::AsyncSocket::anyAddress(),
-      std::string(),
-      boundFd);
+      bindOptions);
   return folly::AsyncTransport::UniquePtr(ring);
 }
 
 folly::AsyncTransport::UniquePtr createIOUringTLS(
     folly::EventBase* evb, const ClientConnectionConfig& cfg) {
   auto sock = folly::AsyncSSLSocket::newSocket(getSslContext(cfg), evb);
-  auto ring =
-      new folly::AsyncIoUringSocket(std::move(sock), getIoUringSocketOptions());
-  folly::NetworkSocket boundFd;
+  auto ring = new folly::AsyncIoUringSocket(
+      std::move(sock), getIoUringSocketOptions(cfg));
+  folly::AsyncSocketTransport::BindOptions bindOptions =
+      folly::AsyncSocket::anyAddress();
   if (cfg.ioUringZcrx && cfg.ioUringZcrxSocketBind) {
-    boundFd = folly::AsyncIoUringSocketFactory::createBoundSocketForZcRx(
+    bindOptions = folly::AsyncIoUringSocketFactory::createBoundSocketForZcRx(
         evb, cfg.serverHost.getIPAddress(), cfg.serverHost.getPort());
   }
   ring->connect(
@@ -336,15 +337,13 @@ folly::AsyncTransport::UniquePtr createIOUringTLS(
       cfg.serverHost,
       std::chrono::milliseconds(0),
       getSocketOptions(cfg),
-      folly::AsyncSocket::anyAddress(),
-      std::string(),
-      boundFd);
+      bindOptions);
   return folly::AsyncTransport::UniquePtr(ring);
 }
 
 folly::AsyncTransport::UniquePtr createIOUringFizz(
     folly::EventBase* evb, const ClientConnectionConfig& cfg) {
-  auto sock = new folly::AsyncIoUringSocket(evb, getIoUringSocketOptions());
+  auto sock = new folly::AsyncIoUringSocket(evb, getIoUringSocketOptions(cfg));
   if (cfg.ioUringZcrx && cfg.ioUringZcrxSocketBind) {
     // TODO: Fizz connect() does not support a boundFd parameter, so ZC-RX
     // source port binding is not supported for the Fizz transport yet.

@@ -35,28 +35,13 @@ namespace apache::thrift::compiler {
 
 namespace {
 
-std::vector<t_function*> lifecycleFunctions() {
+std::vector<const t_function*> lifecycleFunctions() {
   static t_function onStartServing_{
       nullptr, t_primitive_type::t_void(), "onStartServing"};
   static t_function onStopRequested_{
       nullptr, t_primitive_type::t_void(), "onStopRequested"};
 
   return {&onStartServing_, &onStopRequested_};
-}
-
-// TO-DO: remove duplicate in pyi
-mstch::array create_string_array(const std::vector<std::string>& values) {
-  mstch::array mstch_array;
-  for (auto it = values.begin(); it != values.end(); ++it) {
-    mstch_array.emplace_back(
-        mstch::map{
-            {"value", *it},
-            {"first?", it == values.begin()},
-            {"last?", std::next(it) == values.end()},
-        });
-  }
-
-  return mstch_array;
 }
 
 whisker::object to_whisker_string_array(
@@ -187,7 +172,13 @@ bool field_has_default_value(
 
 enum class FileType { CBindingsFile, TypesFile, NotTypesFile };
 
-struct Py3StructuredContext {
+/** Metadata for a program included from the main program being generated */
+struct py3_included_program {
+  const t_program* program;
+  bool importServices;
+};
+
+struct py3_structured_context {
   /** Whether any fields are marked as hidden */
   bool hasHiddenFields{false};
   /** Whether any fields have a default value */
@@ -201,7 +192,10 @@ class py3_generator_context {
   using cached_type_properties =
       apache::thrift::compiler::python::cached_properties;
 
-  py3_generator_context(const t_program* program) : root_program_(program) {}
+  py3_generator_context(
+      const t_program* program,
+      const std::map<std::string, std::string, std::less<>>& compiler_options)
+      : root_program_(program), compiler_options_(compiler_options) {}
 
   cached_type_properties& get_cached_type_props(const t_type* type) const;
 
@@ -210,22 +204,86 @@ class py3_generator_context {
     return field_cpp_kinds_.at(&field);
   }
 
-  const Py3StructuredContext& get_structured_context(
+  const py3_structured_context& get_structured_context(
       const t_structured& structured) const {
     assert(structured_contexts_.contains(&structured));
     return structured_contexts_.at(&structured);
   }
 
-  const t_program* program() const { return root_program_; }
+  const std::map<std::string, py3_included_program>& included_programs(
+      const t_program& program) const {
+    check_root_program(program);
+    return included_programs_;
+  }
+
+  const std::vector<const t_type*>& container_types(
+      const t_program& program) const {
+    check_root_program(program);
+    return container_types_;
+  }
+
+  const std::vector<const t_type*>& custom_templates(
+      const t_program& program) const {
+    check_root_program(program);
+    return custom_templates_;
+  }
+
+  const std::vector<const t_type*>& custom_cpp_types(
+      const t_program& program) const {
+    check_root_program(program);
+    return custom_cpp_types_;
+  }
+
+  const std::map<std::tuple<std::string, bool>, const t_function*>&
+  unique_functions_by_return_type(const t_program& program) const {
+    check_root_program(program);
+    return unique_functions_by_return_type_;
+  }
+
+  const std::map<std::string, const t_type*>& stream_types(
+      const t_program& program) const {
+    check_root_program(program);
+    return stream_types_;
+  }
+
+  const std::map<std::string, const t_type*>& stream_exceptions(
+      const t_program& program) const {
+    check_root_program(program);
+    return stream_exceptions_;
+  }
+
+  const std::vector<const t_function*>& response_and_stream_functions(
+      const t_program& program) const {
+    check_root_program(program);
+    return response_and_stream_functions_;
+  }
+
+  const std::vector<const t_interaction*>& supported_interactions(
+      const t_service& service) const {
+    static const std::vector<const t_interaction*> kEmpty;
+    check_root_program(*service.program());
+    const auto& it = supported_interactions_by_service_.find(&service);
+    return it == supported_interactions_by_service_.end() ? kEmpty : it->second;
+  }
+
+  void visit_function(const t_function& func);
 
   void register_visitors(t_whisker_generator::context_visitor& visitor) {
     using context = t_whisker_generator::whisker_generator_visitor_context;
+    visitor.add_program_visitor([this](const context&, const t_program& p) {
+      if (&p == root_program_) {
+        for (const t_program* included_program : p.get_includes_for_codegen()) {
+          included_programs_[included_program->path()] = py3_included_program{
+              .program = included_program, .importServices = true};
+        }
+      }
+    });
     visitor.add_structured_definition_visitor(
         [this](const context& ctx, const t_structured& node) {
           if (&ctx.program() != root_program_ || is_hidden(node)) {
             return;
           }
-          Py3StructuredContext& node_ctx = structured_contexts_[&node];
+          py3_structured_context& node_ctx = structured_contexts_[&node];
           node_ctx.nonHiddenFields.reserve(node.fields().size());
           for (const t_field& field : node.fields()) {
             if (is_hidden(field)) {
@@ -236,8 +294,12 @@ class py3_generator_context {
             }
           }
         });
-
-    visitor.add_field_visitor([this](const context&, const t_field& field) {
+    visitor.add_field_visitor([this](const context& ctx, const t_field& field) {
+      if (&ctx.program() != root_program_ || is_hidden(field) ||
+          is_hidden(static_cast<const t_structured&>(*ctx.parent()))) {
+        return;
+      }
+      visit_type(&field.type().deref(), /*fromTypeDef=*/false);
       switch (gen::cpp::find_ref_type(field)) {
         case gen::cpp::reference_type::unique: {
           field_cpp_kinds_[&field] = field_cpp_kind::unique_ptr;
@@ -268,21 +330,92 @@ class py3_generator_context {
           throw std::logic_error{"Unhandled ref_type"};
       }
     });
+    visitor.add_function_visitor(
+        [this](const context& ctx, const t_function& func) {
+          if (&ctx.program() != root_program_ || is_hidden(func)) {
+            return;
+          }
+          // Visit for populating program-level type information
+          visit_function(func);
+          // Collect supported interactions
+          if (func.is_interaction_constructor()) {
+            if (const auto* service =
+                    dynamic_cast<const t_service*>(ctx.parent())) {
+              supported_interactions_by_service_[service].emplace_back(
+                  &func.interaction()->as<t_interaction>());
+            }
+          }
+        });
+    visitor.add_const_visitor(
+        [this](const context& ctx, const t_const& constant) {
+          if (&ctx.program() == root_program_) {
+            visit_type(&constant.type_ref().deref(), /*fromTypeDef=*/false);
+          }
+        });
+    visitor.add_typedef_visitor(
+        [this](const context& ctx, const t_typedef& td) {
+          if (&ctx.program() == root_program_ && !is_hidden(td) &&
+              !is_hidden(*td.get_true_type())) {
+            visit_type(&td, /*fromTypeDef=*/true);
+          }
+        });
   }
 
  private:
   const t_program* root_program_;
+  const std::map<std::string, std::string, std::less<>>& compiler_options_;
 
   // Computed properties for the root program
-  std::unordered_map<const t_structured*, Py3StructuredContext>
+  std::map<std::string, py3_included_program> included_programs_;
+  std::unordered_map<const t_structured*, py3_structured_context>
       structured_contexts_;
   std::unordered_map<const t_field*, field_cpp_kind> field_cpp_kinds_;
+
+  std::vector<const t_type*> container_types_;
+  std::vector<const t_type*> custom_templates_;
+  std::vector<const t_type*> custom_cpp_types_;
+  std::unordered_set<std::string> seen_type_names_;
+  std::map<std::tuple<std::string, bool>, const t_function*>
+      unique_functions_by_return_type_;
+  std::map<std::string, const t_type*> stream_types_;
+  std::map<std::string, const t_type*> stream_exceptions_;
+  // Functions with a stream and an initial response.
+  std::vector<const t_function*> response_and_stream_functions_;
+
+  std::unordered_map<const t_service*, std::vector<const t_interaction*>>
+      supported_interactions_by_service_;
 
   // These properties are mutable as they are (or contain) caches which must be
   // accessed from a const method context
   mutable cpp_name_resolver name_resolver_;
   mutable std::unordered_map<const t_type*, cached_type_properties>
       type_properties_;
+
+  void check_root_program(const t_program& program) const {
+    if (&program != root_program_) {
+      throw whisker::eval_error(
+          "This property is only implemented for the root program");
+    }
+  }
+
+  std::string visit_type(const t_type* orig_type, bool fromTypeDef);
+
+  void add_typedef_namespace(const t_type* type) {
+    const t_program* prog = type->program();
+    if (prog != nullptr && prog != root_program_ &&
+        !included_programs_.contains(prog->path())) {
+      included_programs_[prog->path()] =
+          py3_included_program{.program = prog, .importServices = false};
+    }
+  }
+
+  void add_function_by_unique_return_type(
+      const t_function& function, std::string return_type_name) {
+    unique_functions_by_return_type_.insert(
+        {{std::move(return_type_name),
+          cpp2::is_stack_arguments(compiler_options_, function)},
+         &function});
+  }
 };
 
 class py3_mstch_program : public mstch_program {
@@ -298,16 +431,9 @@ class py3_mstch_program : public mstch_program {
         {
             {"program:unique_functions_by_return_type",
              &py3_mstch_program::unique_functions_by_return_type},
-            {"program:needs_container_converters?",
-             &py3_mstch_program::needs_container_converters},
-            {"program:includeNamespaces",
-             &py3_mstch_program::includeNamespaces},
             {"program:containerTypes", &py3_mstch_program::getContainerTypes},
-            {"program:hasContainerTypes",
-             &py3_mstch_program::hasContainerTypes},
             {"program:customTemplates", &py3_mstch_program::getCustomTemplates},
             {"program:customTypes", &py3_mstch_program::getCustomTypes},
-            {"program:has_stream?", &py3_mstch_program::hasStream},
             {"program:stream_types", &py3_mstch_program::getStreamTypes},
             {"program:response_and_stream_functions",
              &py3_mstch_program::response_and_stream_functions},
@@ -317,32 +443,17 @@ class py3_mstch_program : public mstch_program {
             {"program:filtered_typedefs",
              &py3_mstch_program::filtered_typedefs},
         });
-    gather_included_program_namespaces();
-    visit_types_for_services_and_interactions();
-    visit_types_for_objects();
-    visit_types_for_constants();
-    visit_types_for_typedefs();
-
-    for (const t_function* func : lifecycleFunctions()) {
-      add_function_by_unique_return_type(
-          func, visit_type(func->return_type().get_type()));
-    }
   }
 
-  mstch::node getContainerTypes() { return make_mstch_types(containers_); }
-
-  mstch::node hasContainerTypes() { return !containers_.empty(); }
-
-  mstch::node needs_container_converters() {
-    return !containers_.empty() &&
-        (!program_->services().empty() ||
-         has_option("gen_legacy_container_converters"));
+  mstch::node getContainerTypes() {
+    return make_mstch_types(generator_context_.container_types(*program_));
   }
 
   mstch::node unique_functions_by_return_type() {
     std::vector<const t_function*> functions;
     bool no_stream = has_option("no_stream");
-    for (const auto& kvp : uniqueFunctionsByReturnType_) {
+    for (const auto& kvp :
+         generator_context_.unique_functions_by_return_type(*program_)) {
       if (is_func_supported(no_stream, kvp.second)) {
         functions.push_back(kvp.second);
       }
@@ -352,19 +463,24 @@ class py3_mstch_program : public mstch_program {
   }
 
   mstch::node getCustomTemplates() {
-    return make_mstch_types(customTemplates_);
+    return make_mstch_types(generator_context_.custom_templates(*program_));
   }
 
-  mstch::node getCustomTypes() { return make_mstch_types(customTypes_); }
+  mstch::node getCustomTypes() {
+    return make_mstch_types(generator_context_.custom_cpp_types(*program_));
+  }
 
   mstch::node response_and_stream_functions() {
-    return make_mstch_functions(response_and_stream_functions_);
+    return make_mstch_functions(
+        generator_context_.response_and_stream_functions(*program_));
   }
 
   mstch::node getStreamExceptions() {
     std::vector<const t_type*> types;
-    types.reserve(streamExceptions_.size());
-    for (const auto& kvp : streamExceptions_) {
+    const auto& stream_exceptions =
+        generator_context_.stream_exceptions(*program_);
+    types.reserve(stream_exceptions.size());
+    for (const auto& kvp : stream_exceptions) {
       types.push_back(kvp.second);
     }
     return make_mstch_types(types);
@@ -372,137 +488,43 @@ class py3_mstch_program : public mstch_program {
 
   mstch::node getStreamTypes() {
     std::vector<const t_type*> types;
+    const auto& stream_types = generator_context_.stream_types(*program_);
+    types.reserve(stream_types.size());
     if (!has_option("no_stream")) {
-      for (const auto& kvp : streamTypes_) {
+      for (const auto& kvp : stream_types) {
         types.push_back(kvp.second);
       }
     }
     return make_mstch_types(types);
   }
 
-  mstch::node includeNamespaces() {
-    mstch::array mstch_array;
-    for (const auto& kvp : includeNamespaces_) {
-      mstch_array.emplace_back(
-          mstch::map{
-              {"includeNamespace", create_string_array(kvp.second.ns)},
-              {"hasServices?", kvp.second.hasServices},
-              {"hasTypes?", kvp.second.hasTypes}});
-    }
-    return mstch_array;
-  }
-
-  mstch::node hasStream() {
-    return !has_option("no_stream") && !streamTypes_.empty();
-  }
-
  protected:
-  struct Namespace {
-    std::vector<std::string> ns;
-    bool hasServices;
-    bool hasTypes;
-  };
-
-  void gather_included_program_namespaces() {
-    for (const auto* program : program_->get_includes_for_codegen()) {
-      includeNamespaces_[program->path()] = Namespace{
-          get_py3_namespace_with_name(program),
-          !program->services().empty(),
-          has_types(program)};
-    }
-  }
-
-  void add_typedef_namespace(const t_type* type) {
-    const auto* prog = type->program();
-    if ((prog != nullptr) && (prog != program_)) {
-      const auto& path = prog->path();
-      if (includeNamespaces_.find(path) != includeNamespaces_.end()) {
-        return;
-      }
-      includeNamespaces_[path] =
-          Namespace{get_py3_namespace_with_name(prog), false, true};
-    }
-  }
-
-  void add_function_by_unique_return_type(
-      const t_function* function, std::string return_type_name) {
-    auto sa = cpp2::is_stack_arguments(*context_.options, *function);
-    uniqueFunctionsByReturnType_.insert(
-        {{std::move(return_type_name), sa}, function});
-  }
-
-  void visit_type_single_service(const t_service* service);
-
-  void visit_types_for_services_and_interactions() {
-    for (const auto* service : program_->services()) {
-      visit_type_single_service(service);
-    }
-    for (const auto* interaction : program_->interactions()) {
-      visit_type_single_service(interaction);
-    }
-  }
-
-  void visit_types_for_objects() {
-    for (t_structured* object : program_->structured_definitions()) {
-      if (is_hidden(*object)) {
-        continue;
-      }
-      for (const auto& field : object->fields()) {
-        if (is_hidden(field)) {
-          continue;
-        }
-        visit_type(field.type().get_type());
-      }
-      objects_.push_back(object);
-    }
-  }
-
-  void visit_types_for_constants() {
-    for (const auto& constant : program_->consts()) {
-      visit_type(constant->type());
-    }
-  }
-
-  void visit_types_for_typedefs() {
-    for (const auto* typedef_def : program_->typedefs()) {
-      if (is_hidden(*typedef_def) || is_hidden(*typedef_def->get_true_type())) {
-        continue;
-      }
-      visit_type(typedef_def);
-      typedefs_.push_back(typedef_def);
-    }
-  }
-
-  std::string visit_type_impl(const t_type* orig_type, bool fromTypeDef);
-
-  std::string visit_type(const t_type* orig_type) {
-    return visit_type_impl(orig_type, orig_type->is<t_typedef>());
-  }
-
   mstch::node filtered_objects() {
+    std::vector<const t_structured*> visible;
+    visible.reserve(program_->structured_definitions().size());
+    for (const t_structured* s : program_->structured_definitions()) {
+      if (!is_hidden(*s)) {
+        visible.emplace_back(s);
+      }
+    }
     std::string id =
         program_cache_id(program_, get_program_namespace(program_));
     return make_mstch_array_cached(
-        objects_, *context_.struct_factory, context_.struct_cache, id);
+        visible, *context_.struct_factory, context_.struct_cache, id);
   }
 
-  mstch::node filtered_typedefs() { return make_mstch_typedefs(typedefs_); }
+  mstch::node filtered_typedefs() {
+    std::vector<const t_typedef*> visible;
+    visible.reserve(program_->typedefs().size());
+    for (const t_typedef* t : program_->typedefs()) {
+      if (!is_hidden(*t) && !is_hidden(*t->get_true_type())) {
+        visible.emplace_back(t);
+      }
+    }
+    return make_mstch_typedefs(visible);
+  }
 
   py3_generator_context& generator_context_;
-  std::vector<const t_type*> containers_;
-  std::vector<const t_type*> customTemplates_;
-  std::vector<const t_type*> customTypes_;
-  std::unordered_set<std::string> seenTypeNames_;
-  std::map<std::string, Namespace> includeNamespaces_;
-  std::map<std::tuple<std::string, bool>, const t_function*>
-      uniqueFunctionsByReturnType_;
-  std::map<std::string, const t_type*> streamTypes_;
-  std::map<std::string, const t_type*> streamExceptions_;
-  std::vector<const t_structured*> objects_;
-  std::vector<const t_typedef*> typedefs_;
-
-  // Functions with a stream and an initial response.
-  std::vector<const t_function*> response_and_stream_functions_;
 };
 
 struct interaction_name_less {
@@ -517,9 +539,10 @@ class py3_mstch_service : public mstch_service {
       const t_service* service,
       mstch_context& ctx,
       mstch_element_position pos,
-      const t_program* prog,
+      const py3_generator_context* generator_context,
       const t_service* containing_service = nullptr)
-      : mstch_service(service, ctx, pos, containing_service), prog_{prog} {
+      : mstch_service(service, ctx, pos, containing_service),
+        generator_context_{*generator_context} {
     register_methods(
         this,
         {
@@ -532,14 +555,6 @@ class py3_mstch_service : public mstch_service {
             {"service:supportedInteractions",
              &py3_mstch_service::get_supported_interactions},
         });
-
-    // Collect supported interactions
-    for (const auto& function : service_->functions()) {
-      if (function.is_interaction_constructor()) {
-        supported_interactions_.insert(
-            &function.interaction()->as<t_interaction>());
-      }
-    }
   }
 
   std::vector<const t_function*> supportedFunctions() {
@@ -570,12 +585,12 @@ class py3_mstch_service : public mstch_service {
   }
 
   mstch::node get_supported_interactions() {
-    return make_mstch_interactions(supported_interactions_, service_);
+    return make_mstch_interactions(
+        generator_context_.supported_interactions(*service_), service_);
   }
 
- protected:
-  const t_program* prog_;
-  std::set<const t_interaction*, interaction_name_less> supported_interactions_;
+ private:
+  const py3_generator_context& generator_context_;
 };
 
 class py3_mstch_struct : public mstch_struct {
@@ -604,13 +619,13 @@ class py3_mstch_struct : public mstch_struct {
   const py3_generator_context& context_;
 };
 
-std::string py3_mstch_program::visit_type_impl(
+std::string py3_generator_context::visit_type(
     const t_type* orig_type, bool fromTypeDef) {
   bool hasPy3EnableCppAdapterAnnot =
       orig_type->has_structured_annotation(kPythonPy3EnableCppAdapterUri);
   auto trueType = orig_type->get_true_type();
   py3_generator_context::cached_type_properties& props =
-      generator_context_.get_cached_type_props(orig_type);
+      get_cached_type_props(orig_type);
   const std::string& flatName = props.flat_name();
   // Import all types either beneath a typedef, even if the current type is
   // not directly a typedef
@@ -618,21 +633,22 @@ std::string py3_mstch_program::visit_type_impl(
   if (flatName.empty()) {
     std::string extra;
     if (const t_list* list = trueType->try_as<t_list>()) {
-      extra =
-          "List__" + visit_type_impl(list->elem_type().get_type(), fromTypeDef);
+      extra = fmt::format(
+          "List__{}", visit_type(&list->elem_type().deref(), fromTypeDef));
     } else if (const t_set* set = trueType->try_as<t_set>()) {
-      extra =
-          "Set__" + visit_type_impl(set->elem_type().get_type(), fromTypeDef);
+      extra = fmt::format(
+          "Set__{}", visit_type(&set->elem_type().deref(), fromTypeDef));
     } else if (const t_map* map = trueType->try_as<t_map>()) {
-      extra = "Map__" +
-          visit_type_impl(map->key_type().get_type(), fromTypeDef) + "_" +
-          visit_type_impl(map->val_type().get_type(), fromTypeDef);
+      extra = fmt::format(
+          "Map__{}_{}",
+          visit_type(&map->key_type().deref(), fromTypeDef),
+          visit_type(&map->val_type().deref(), fromTypeDef));
     } else if (trueType->is_binary()) {
       extra = "binary";
     } else {
       extra = trueType->name();
     }
-    props.set_flat_name(generator_context_.program(), trueType, extra);
+    props.set_flat_name(root_program_, trueType, extra);
   }
   assert(!flatName.empty());
   // If this type or a parent of this type is a typedef,
@@ -641,16 +657,16 @@ std::string py3_mstch_program::visit_type_impl(
   if (fromTypeDef) {
     add_typedef_namespace(trueType);
   }
-  bool inserted = seenTypeNames_.insert(flatName).second;
-  if (inserted) {
+  if (seen_type_names_.insert(flatName).second) {
     if (trueType->is<t_container>()) {
-      containers_.push_back(hasPy3EnableCppAdapterAnnot ? orig_type : trueType);
+      container_types_.push_back(
+          hasPy3EnableCppAdapterAnnot ? orig_type : trueType);
     }
     if (!props.is_default_template(trueType)) {
-      customTemplates_.push_back(trueType);
+      custom_templates_.push_back(trueType);
     }
     if (!props.cpp_type().empty()) {
-      customTypes_.push_back(
+      custom_cpp_types_.push_back(
           hasPy3EnableCppAdapterAnnot ? orig_type : trueType);
     }
   }
@@ -731,49 +747,45 @@ bool validate_union(sema_context& ctx, const t_union& s) {
 
 } // namespace enum_member_union_field_names_validator
 
-void py3_mstch_program::visit_type_single_service(const t_service* service) {
-  for (const auto& function : service->functions()) {
-    if (is_hidden(function)) {
-      continue;
-    }
-
-    for (const auto& field : function.params().fields()) {
-      visit_type(field.type().get_type());
-    }
-    const t_stream* stream = function.stream();
-    if (const t_throws* exceptions = stream ? stream->exceptions() : nullptr) {
-      for (const t_field& field : exceptions->fields()) {
-        const t_type* exType = field.type().get_type();
-        streamExceptions_.emplace(visit_type(field.type().get_type()), exType);
-      }
-    }
-    for (const t_field& field : get_elems(function.exceptions())) {
-      visit_type(field.type().get_type());
-    }
-
-    std::string return_type_name;
-    if (stream && !function.is_interaction_constructor()) {
-      return_type_name = "Stream__";
-      const t_type* elem_type = stream->elem_type().get_type();
-      if (!function.has_void_initial_response()) {
-        return_type_name = "ResponseAndStream__" +
-            visit_type(function.return_type().get_type()) + "_";
-      }
-      std::string elem_type_name = visit_type(elem_type);
-      return_type_name += elem_type_name;
-      streamTypes_.emplace(elem_type_name, elem_type);
-      bool inserted = seenTypeNames_.insert(return_type_name).second;
-      if (inserted && !function.has_void_initial_response()) {
-        response_and_stream_functions_.push_back(&function);
-      }
-    } else if (!function.sink()) {
-      const auto type = function.is_interaction_constructor()
-          ? function.interaction()
-          : function.return_type();
-      return_type_name = visit_type(type.get_type());
-    }
-    add_function_by_unique_return_type(&function, std::move(return_type_name));
+void py3_generator_context::visit_function(const t_function& function) {
+  for (const auto& field : function.params().fields()) {
+    visit_type(&field.type().deref(), /*fromTypeDef=*/false);
   }
+  const t_stream* stream = function.stream();
+  if (const t_throws* exceptions = stream ? stream->exceptions() : nullptr) {
+    for (const t_field& field : exceptions->fields()) {
+      const t_type* exType = &field.type().deref();
+      stream_exceptions_.emplace(
+          visit_type(&field.type().deref(), /*fromTypeDef=*/false), exType);
+    }
+  }
+  for (const t_field& field : get_elems(function.exceptions())) {
+    visit_type(&field.type().deref(), /*fromTypeDef=*/false);
+  }
+
+  std::string return_type_name;
+  if (stream && !function.is_interaction_constructor()) {
+    return_type_name = "Stream__";
+    const t_type* elem_type = &stream->elem_type().deref();
+    if (!function.has_void_initial_response()) {
+      return_type_name = fmt::format(
+          "ResponseAndStream__{}_",
+          visit_type(&function.return_type().deref(), /*fromTypeDef=*/false));
+    }
+    std::string elem_type_name = visit_type(elem_type, /*fromTypeDef=*/false);
+    return_type_name += elem_type_name;
+    stream_types_.emplace(elem_type_name, elem_type);
+    if (seen_type_names_.insert(return_type_name).second &&
+        !function.has_void_initial_response()) {
+      response_and_stream_functions_.push_back(&function);
+    }
+  } else if (!function.sink()) {
+    const t_type_ref& type = function.is_interaction_constructor()
+        ? function.interaction()
+        : function.return_type();
+    return_type_name = visit_type(&type.deref(), /*fromTypeDef=*/false);
+  }
+  add_function_by_unique_return_type(function, std::move(return_type_name));
 }
 
 class t_mstch_py3_generator : public t_mstch_generator {
@@ -812,7 +824,11 @@ class t_mstch_py3_generator : public t_mstch_generator {
  private:
   void set_mstch_factories();
   void generate_init_files();
-  void generate_file(
+  void generate_mstch_file(
+      const std::string& template_name,
+      FileType file_type,
+      const std::filesystem::path& base);
+  void generate_whisker_file(
       const std::string& template_name,
       FileType file_type,
       const std::filesystem::path& base);
@@ -825,8 +841,14 @@ class t_mstch_py3_generator : public t_mstch_generator {
   std::unique_ptr<py3_generator_context> context_;
 
   void initialize_context(t_whisker_generator::context_visitor& visitor) final {
-    context_ = std::make_unique<py3_generator_context>(program_);
+    context_ =
+        std::make_unique<py3_generator_context>(program_, compiler_options());
     context_->register_visitors(visitor);
+    // Lifecycle functions aren't actually part of the program's AST, so we have
+    // to visit them manually.
+    for (const t_function* func : lifecycleFunctions()) {
+      context_->visit_function(*func);
+    }
   }
 
   whisker::map::raw globals(prototype_database& proto) const override {
@@ -846,6 +868,10 @@ class t_mstch_py3_generator : public t_mstch_generator {
   const t_program* get_true_type_program(const t_type& type) const {
     const t_type* resolved = type.get_true_type();
     return resolved->program() == nullptr ? program_ : resolved->program();
+  }
+
+  void define_additional_prototypes(prototype_database& proto) const override {
+    proto.define(make_prototype_for_included_program());
   }
 
   prototype<t_const_value>::ptr make_prototype_for_const_value(
@@ -985,6 +1011,27 @@ class t_mstch_py3_generator : public t_mstch_generator {
       return whisker::make::array(std::move(consts));
     });
     def.property(
+        "py3_visible_structured_definitions", [&proto](const t_program& self) {
+          whisker::array::raw visible;
+          visible.reserve(self.structured_definitions().size());
+          for (const t_structured* s : self.structured_definitions()) {
+            if (!is_hidden(*s)) {
+              visible.emplace_back(proto.create<t_structured>(*s));
+            }
+          }
+          return whisker::make::array(std::move(visible));
+        });
+    def.property("py3_visible_typedefs", [&proto](const t_program& self) {
+      whisker::array::raw visible;
+      visible.reserve(self.typedefs().size());
+      for (const t_typedef* t : self.typedefs()) {
+        if (!is_hidden(*t) && !is_hidden(*t->get_true_type())) {
+          visible.emplace_back(proto.create<t_typedef>(*t));
+        }
+      }
+      return whisker::make::array(std::move(visible));
+    });
+    def.property(
         "has_types?", [](const t_program& self) { return has_types(&self); });
     def.property("has_visible_union_types?", [](const t_program& self) {
       return std::any_of(
@@ -1037,6 +1084,81 @@ class t_mstch_py3_generator : public t_mstch_generator {
     def.property("py3Namespaces", [](const t_program& self) {
       return to_whisker_string_array(get_py3_namespace(&self));
     });
+    def.property("includeNamespaces", [&](const t_program& self) {
+      whisker::array::raw includes;
+      for (const auto& [_, include] : context_->included_programs(self)) {
+        includes.emplace_back(proto.create<py3_included_program>(include));
+      }
+      return whisker::make::array(std::move(includes));
+    });
+    def.property("has_container_types?", [this](const t_program& self) {
+      return !context_->container_types(self).empty();
+    });
+    def.property("needs_container_converters?", [this](const t_program& self) {
+      return !context_->container_types(self).empty() &&
+          (!self.services().empty() ||
+           has_compiler_option("gen_legacy_container_converters"));
+    });
+    def.property("has_stream?", [this](const t_program& self) {
+      return !has_compiler_option("no_stream") &&
+          !context_->stream_types(self).empty();
+    });
+    def.property("custom_templates", [&](const t_program& self) {
+      return to_array(context_->custom_templates(self), proto.of<t_type>());
+    });
+    def.property("custom_cpp_types", [&](const t_program& self) {
+      return to_array(context_->custom_cpp_types(self), proto.of<t_type>());
+    });
+
+    return std::move(def).make();
+  }
+
+  prototype<py3_included_program>::ptr make_prototype_for_included_program()
+      const {
+    whisker::dsl::prototype_builder<
+        whisker::native_handle<py3_included_program>>
+        def;
+
+    def.property(
+        "modulePathPeriodSeparated", [](const py3_included_program& self) {
+          std::vector<std::string> segments =
+              get_py3_namespace_with_name(self.program);
+          assert(!segments.empty());
+          return fmt::format("{}", fmt::join(segments, "."));
+        });
+    def.property(
+        "modulePathUnderscoreSeparated", [](const py3_included_program& self) {
+          std::vector<std::string> segments =
+              get_py3_namespace_with_name(self.program);
+          assert(!segments.empty());
+          return fmt::format("{}", fmt::join(segments, "_"));
+        });
+    def.property("import_services?", [](const py3_included_program& self) {
+      return self.importServices && !self.program->services().empty();
+    });
+    def.property("has_types?", [](const py3_included_program& self) {
+      return has_types(self.program);
+    });
+
+    return std::move(def).make();
+  }
+
+  prototype<t_interface>::ptr make_prototype_for_interface(
+      const prototype_database& proto) const override {
+    auto base = t_whisker_generator::make_prototype_for_interface(proto);
+    auto def =
+        whisker::dsl::prototype_builder<h_interface>::extends(std::move(base));
+
+    def.property("supportedFunctions", [&](const t_interface& self) {
+      whisker::array::raw functions;
+      bool no_stream = has_compiler_option("no_stream");
+      for (const t_function& func : self.functions()) {
+        if (is_func_supported(no_stream, &func)) {
+          functions.emplace_back(proto.create<t_function>(func));
+        }
+      }
+      return whisker::make::array(std::move(functions));
+    });
 
     return std::move(def).make();
   }
@@ -1049,6 +1171,13 @@ class t_mstch_py3_generator : public t_mstch_generator {
 
     def.property("externalProgram?", [this](const t_service& self) {
       return self.program() != program_;
+    });
+    def.property("lifecycleFunctions", [&proto](const t_service&) {
+      return to_array(lifecycleFunctions(), proto.of<t_function>());
+    });
+    def.property("supportedInteractions", [&](const t_service& self) {
+      return to_array(
+          context_->supported_interactions(self), proto.of<t_interaction>());
     });
 
     return std::move(def).make();
@@ -1082,6 +1211,11 @@ class t_mstch_py3_generator : public t_mstch_generator {
     def.property("has_defaulted_fields?", [this](const t_structured& self) {
       return context_->get_structured_context(self).hasDefaultedFields &&
           !self.is<t_union>();
+    });
+    def.property("py3_fields", [&](const t_structured& self) {
+      return to_array(
+          context_->get_structured_context(self).nonHiddenFields,
+          proto.of<t_field>());
     });
 
     return std::move(def).make();
@@ -1304,7 +1438,7 @@ py3_generator_context::get_cached_type_props(const t_type* type) const {
 
 void t_mstch_py3_generator::set_mstch_factories() {
   mstch_context_.add<py3_mstch_program>(context_.get());
-  mstch_context_.add<py3_mstch_service>(program_);
+  mstch_context_.add<py3_mstch_service>(context_.get());
   mstch_context_.add<py3_mstch_struct>(context_.get());
 }
 
@@ -1327,7 +1461,7 @@ std::filesystem::path t_mstch_py3_generator::package_to_path() {
   return path;
 }
 
-void t_mstch_py3_generator::generate_file(
+void t_mstch_py3_generator::generate_mstch_file(
     const std::string& template_name,
     FileType file_type,
     const std::filesystem::path& base = {}) {
@@ -1342,6 +1476,22 @@ void t_mstch_py3_generator::generate_file(
       template_name,
       base / program_name / template_name // (output) path
   );
+}
+
+void t_mstch_py3_generator::generate_whisker_file(
+    const std::string& template_name,
+    FileType file_type,
+    const std::filesystem::path& base = {}) {
+  file_type_ = file_type;
+  whisker::object context = whisker::make::map({
+      {"program",
+       whisker::make::native_handle(
+           render_state().prototypes->create<t_program>(*program_))},
+  });
+  t_whisker_generator::render_to_file(
+      /*output_file=*/base / program_->name() / template_name,
+      /*template_file=*/template_name,
+      /*context=*/context);
 }
 
 void t_mstch_py3_generator::generate_types() {
@@ -1390,39 +1540,41 @@ void t_mstch_py3_generator::generate_types() {
       "metadata.cpp",
   };
 
-  generate_file("cbindings.pxd", FileType::CBindingsFile, generateRootPath_);
+  generate_whisker_file(
+      "cbindings.pxd", FileType::CBindingsFile, generateRootPath_);
 
   if (has_option("enable_container_pickling_DO_NOT_USE")) {
-    generate_file("__init__.py", FileType::TypesFile, generateRootPath_);
+    generate_whisker_file(
+        "__init__.py", FileType::TypesFile, generateRootPath_);
   }
   if (has_option("inplace_migrate")) {
-    generate_file(
+    generate_mstch_file(
         "types_inplace_FBTHRIFT_ONLY_DO_NOT_USE.py",
         FileType::TypesFile,
         generateRootPath_);
   }
   for (const auto& file : converterFiles) {
-    generate_file(file, FileType::NotTypesFile, generateRootPath_);
+    generate_mstch_file(file, FileType::NotTypesFile, generateRootPath_);
   }
   // - if auto_migrate is present, generate types.pxd, and types.py
   // - else, just generate normal cython files
   for (const auto& file : autoMigrateFilesWithTypeContext) {
-    generate_file(file, FileType::TypesFile, generateRootPath_);
+    generate_mstch_file(file, FileType::TypesFile, generateRootPath_);
   }
   for (const auto& file : autoMigrateFilesNoTypeContext) {
-    generate_file(file, FileType::NotTypesFile, generateRootPath_);
+    generate_mstch_file(file, FileType::NotTypesFile, generateRootPath_);
   }
   for (const auto& file : cythonFilesWithTypeContext) {
-    generate_file(file, FileType::TypesFile, generateRootPath_);
+    generate_mstch_file(file, FileType::TypesFile, generateRootPath_);
   }
   for (const auto& file : cppFilesWithTypeContext) {
-    generate_file(file, FileType::TypesFile);
+    generate_mstch_file(file, FileType::TypesFile);
   }
   for (const auto& file : cythonFilesNoTypeContext) {
-    generate_file(file, FileType::NotTypesFile, generateRootPath_);
+    generate_mstch_file(file, FileType::NotTypesFile, generateRootPath_);
   }
   for (const auto& file : cppFilesWithNoTypeContext) {
-    generate_file(file, FileType::NotTypesFile);
+    generate_mstch_file(file, FileType::NotTypesFile);
   }
 }
 
@@ -1468,16 +1620,16 @@ void t_mstch_py3_generator::generate_services() {
   // - if auto_migrate isn't present, just generate all the normal files
 
   for (const auto& file : pythonFiles) {
-    generate_file(file, FileType::NotTypesFile, generateRootPath_);
+    generate_mstch_file(file, FileType::NotTypesFile, generateRootPath_);
   }
   for (const auto& file : normalCythonFiles) {
-    generate_file(file, FileType::NotTypesFile, generateRootPath_);
+    generate_mstch_file(file, FileType::NotTypesFile, generateRootPath_);
   }
   for (const auto& file : cppFiles) {
-    generate_file(file, FileType::NotTypesFile);
+    generate_mstch_file(file, FileType::NotTypesFile);
   }
   for (const auto& file : cythonFiles) {
-    generate_file(file, FileType::NotTypesFile, generateRootPath_);
+    generate_mstch_file(file, FileType::NotTypesFile, generateRootPath_);
   }
 }
 
