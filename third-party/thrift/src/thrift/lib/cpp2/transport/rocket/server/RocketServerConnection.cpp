@@ -315,18 +315,6 @@ RocketServerConnection::~RocketServerConnection() {
   }
 }
 
-namespace {
-StreamRpcError getStreamConnectionClosingError() {
-  StreamRpcError streamRpcError;
-  streamRpcError.code() = StreamRpcErrorCode::SERVER_CLOSING_CONNECTION;
-  streamRpcError.name_utf8() =
-      apache::thrift::TEnumTraits<StreamRpcErrorCode>::findName(
-          StreamRpcErrorCode::SERVER_CLOSING_CONNECTION);
-  streamRpcError.what_utf8() = "Server closing connection, cancelling stream";
-  return streamRpcError;
-}
-} // namespace
-
 void RocketServerConnection::closeIfNeeded() {
   if (state_ == ConnectionState::DRAINING && inflightRequests_ == 0 &&
       inflightSinkFinalResponses_ == 0) {
@@ -377,12 +365,6 @@ void RocketServerConnection::closeIfNeeded() {
     folly::variant_match(
         callback,
         [&](const std::unique_ptr<RocketStreamClientCallback>& callback) {
-          sendErrorAfterDrain(
-              callback->streamId(),
-              RocketException(
-                  ErrorCode::CANCELED,
-                  getPayloadSerializer()->packCompact(
-                      getStreamConnectionClosingError())));
           callback->handleConnectionClose();
         },
         [](const std::unique_ptr<RocketSinkClientCallback>& callback) {
@@ -1006,6 +988,7 @@ void RocketServerConnection::timeoutExpired() noexcept {
   DestructorGuard dg(this);
 
   if (!isBusy()) {
+    frameHandler_->onIdleTimeout();
     closeWhenIdle();
   }
 }
@@ -1421,10 +1404,24 @@ std::vector<InteractionInfo> RocketServerConnection::getInteractionSnapshots()
       apache::thrift::detail::TileInternalAPI tileApi(tile);
       result.push_back(
           InteractionInfo{
-              id, tile.getInteractionCreationTime(), tileApi.getRefCount()});
+              id,
+              tile.getInteractionCreationTime(),
+              tileApi.getLastActivityTime(),
+              tileApi.getRefCount()});
     });
   }
   return result;
+}
+
+void RocketServerConnection::terminateInteraction(int64_t id) {
+  if (evb_.isInEventBaseThread()) {
+    frameHandler_->terminateInteraction(id);
+  } else {
+    evb_.runInEventBaseThread(
+        [this, dg = folly::DelayedDestruction::DestructorGuard(this), id] {
+          frameHandler_->terminateInteraction(id);
+        });
+  }
 }
 
 } // namespace apache::thrift::rocket

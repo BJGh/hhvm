@@ -4603,6 +4603,35 @@ end = struct
       in
       let (env, ty) = Async.overload_extract_from_awaitable env ~p rty in
       make_result env p (Aast.Await te) ty
+    | Delay e ->
+      let (env, te, rty) =
+        expr
+          ~expected:None
+          ~ctxt:
+            Context.
+              {
+                default with
+                is_attribute_param = ctxt.is_attribute_param;
+                accept_using_var = false;
+                check_defined = ctxt.check_defined;
+              }
+          env
+          e
+      in
+      let r = Reason.witness p in
+      let mixed = MakeType.mixed r in
+      let expected_type = MakeType.awaitable r mixed in
+      let (env, ty_err_opt) =
+        Type.sub_type
+          p
+          Reason.URdelay
+          env
+          rty
+          expected_type
+          Typing_error.Callback.unify_error
+      in
+      Option.iter ~f:(Typing_error_utils.add_typing_error ~env) ty_err_opt;
+      make_result env p (Aast.Delay te) rty
     | ReadonlyExpr e ->
       let env = Env.set_readonly env true in
       let (env, te, rty) =
@@ -5887,8 +5916,7 @@ end = struct
       let result = make_call env te tal tel typed_unpack_element ty in
       (result, should_forget_fakes)
     in
-    let type_structure_impl pos e1 e2 =
-      let should_forget_fakes = false in
+    let type_structure_impl ~fn pos e1 e2 =
       match Aast_utils.arg_to_expr e2 with
       | (_, p, String cst) ->
         (* find the class constant implicitly defined by the typeconst *)
@@ -5923,19 +5951,18 @@ end = struct
               Typing_error.(
                 primary
                 @@ Primary.Illegal_type_structure
-                     { pos; msg = "Could not resolve the type constant" })
+                     { pos; msg = "Could not resolve the type constant"; fn })
           | _ -> ()
         in
-        (result, should_forget_fakes)
+        result
       | _ ->
         Typing_error_utils.add_typing_error
           ~env
           Typing_error.(
             primary
             @@ Primary.Illegal_type_structure
-                 { pos; msg = "Second argument is not a string" });
-        let result = expr_error env pos e in
-        (result, should_forget_fakes)
+                 { pos; msg = "Second argument is not a string"; fn });
+        expr_error env pos e
     in
     match fun_expr with
     (* Special top-level function *)
@@ -6100,8 +6127,52 @@ end = struct
         when String.equal type_structure SN.StdlibFunctions.type_structure
              && Int.equal (List.length el) 2
              && Option.is_none unpacked_element ->
+        let should_forget_fakes = false in
         (match el with
-        | [e1; e2] -> type_structure_impl pos e1 e2
+        | [e1; e2] ->
+          let result = type_structure_impl ~fn:type_structure pos e1 e2 in
+          (result, should_forget_fakes)
+        | _ -> assert false)
+      | type_structure_classname
+        when String.equal
+               type_structure_classname
+               SN.StdlibFunctions.type_structure_classname
+             && Int.equal (List.length el) 2
+             && Option.is_none unpacked_element ->
+        let should_forget_fakes = false in
+        (match el with
+        | [e1; e2] ->
+          let (env, te, const_ty) =
+            type_structure_impl ~fn:type_structure_classname pos e1 e2
+          in
+          let (env, const_ty) = Env.expand_type env const_ty in
+          let (env, const_ty) =
+            Typing_dynamic_utils.strip_dynamic env const_ty
+          in
+          let result =
+            match get_node const_ty with
+            | Tnewtype (name, [ty_arg], _)
+              when String.equal name SN.FB.cTypeStructure ->
+              if Typing_structure.is_enum_or_classish env ty_arg then
+                let ty = MakeType.classname (get_reason const_ty) [ty_arg] in
+                (env, te, ty)
+              else begin
+                Typing_error_utils.add_typing_error
+                  ~env
+                  Typing_error.(
+                    primary
+                    @@ Primary.Illegal_type_structure
+                         {
+                           pos;
+                           msg =
+                             "The type constant does not resolve to a classish type";
+                           fn = type_structure_classname;
+                         });
+                expr_error env pos e
+              end
+            | _ -> expr_error env pos e
+          in
+          (result, should_forget_fakes)
         | _ -> assert false)
       | _ -> dispatch_id env id
     end

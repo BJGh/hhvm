@@ -429,8 +429,6 @@ class py3_mstch_program : public mstch_program {
     register_methods(
         this,
         {
-            {"program:unique_functions_by_return_type",
-             &py3_mstch_program::unique_functions_by_return_type},
             {"program:containerTypes", &py3_mstch_program::getContainerTypes},
             {"program:customTemplates", &py3_mstch_program::getCustomTemplates},
             {"program:customTypes", &py3_mstch_program::getCustomTypes},
@@ -447,19 +445,6 @@ class py3_mstch_program : public mstch_program {
 
   mstch::node getContainerTypes() {
     return make_mstch_types(generator_context_.container_types(*program_));
-  }
-
-  mstch::node unique_functions_by_return_type() {
-    std::vector<const t_function*> functions;
-    bool no_stream = has_option("no_stream");
-    for (const auto& kvp :
-         generator_context_.unique_functions_by_return_type(*program_)) {
-      if (is_func_supported(no_stream, kvp.second)) {
-        functions.push_back(kvp.second);
-      }
-    }
-
-    return make_mstch_functions(functions);
   }
 
   mstch::node getCustomTemplates() {
@@ -550,8 +535,6 @@ class py3_mstch_service : public mstch_service {
              &py3_mstch_service::get_supported_functions},
             {"service:lifecycleFunctions",
              &py3_mstch_service::get_lifecycle_functions},
-            {"service:supportedFunctionsWithLifecycle",
-             &py3_mstch_service::get_supported_functions_with_lifecycle},
             {"service:supportedInteractions",
              &py3_mstch_service::get_supported_interactions},
         });
@@ -574,14 +557,6 @@ class py3_mstch_service : public mstch_service {
 
   mstch::node get_supported_functions() {
     return make_mstch_functions(supportedFunctions());
-  }
-
-  mstch::node get_supported_functions_with_lifecycle() {
-    auto funcs = supportedFunctions();
-    for (auto* func : lifecycleFunctions()) {
-      funcs.push_back(func);
-    }
-    return make_mstch_functions(funcs);
   }
 
   mstch::node get_supported_interactions() {
@@ -832,6 +807,23 @@ class t_mstch_py3_generator : public t_mstch_generator {
       const std::string& template_name,
       FileType file_type,
       const std::filesystem::path& base);
+  /**
+   * Generate a list of templates, with a mix of mstch/whisker
+   * TODO(T256504508): Remove once all templates render with Whisker.
+   */
+  void generate_mixed_template_list(
+      const std::vector<
+          std::pair<std::string /*template*/, bool /*use_whisker*/>>& templates,
+      FileType file_type,
+      const std::filesystem::path& base = {}) {
+    for (const auto& [template_name, use_whisker] : templates) {
+      if (use_whisker) {
+        generate_whisker_file(template_name, file_type, base);
+      } else {
+        generate_mstch_file(template_name, file_type, base);
+      }
+    }
+  }
   void generate_types();
   void generate_services();
   std::filesystem::path package_to_path();
@@ -1016,7 +1008,7 @@ class t_mstch_py3_generator : public t_mstch_generator {
           visible.reserve(self.structured_definitions().size());
           for (const t_structured* s : self.structured_definitions()) {
             if (!is_hidden(*s)) {
-              visible.emplace_back(proto.create<t_structured>(*s));
+              visible.emplace_back(resolve_derived_t_type(proto, *s));
             }
           }
           return whisker::make::array(std::move(visible));
@@ -1103,11 +1095,39 @@ class t_mstch_py3_generator : public t_mstch_generator {
       return !has_compiler_option("no_stream") &&
           !context_->stream_types(self).empty();
     });
+    def.property("container_types", [&](const t_program& self) {
+      return to_type_array(context_->container_types(self), proto);
+    });
+    def.property("stream_types", [&](const t_program& self) {
+      std::vector<const t_type*> types;
+      if (!has_compiler_option("no_stream")) {
+        for (const auto& [_, type] : context_->stream_types(self)) {
+          types.emplace_back(type);
+        }
+      }
+      return to_type_array(types, proto);
+    });
+    def.property("response_and_stream_functions", [&](const t_program& self) {
+      return to_array(
+          context_->response_and_stream_functions(self),
+          proto.of<t_function>());
+    });
+    def.property("unique_functions_by_return_type", [&](const t_program& self) {
+      std::vector<const t_function*> functions;
+      bool no_stream = has_compiler_option("no_stream");
+      for (const auto& [_, func] :
+           context_->unique_functions_by_return_type(self)) {
+        if (is_func_supported(no_stream, func)) {
+          functions.emplace_back(func);
+        }
+      }
+      return to_array(functions, proto.of<t_function>());
+    });
     def.property("custom_templates", [&](const t_program& self) {
-      return to_array(context_->custom_templates(self), proto.of<t_type>());
+      return to_type_array(context_->custom_templates(self), proto);
     });
     def.property("custom_cpp_types", [&](const t_program& self) {
-      return to_array(context_->custom_cpp_types(self), proto.of<t_type>());
+      return to_type_array(context_->custom_cpp_types(self), proto);
     });
 
     return std::move(def).make();
@@ -1510,10 +1530,10 @@ void t_mstch_py3_generator::generate_types() {
       "converter.pyx",
   };
 
-  std::vector<std::string> cythonFilesWithTypeContext{
-      "types.pyx",
-      "types.pxd",
-      "types.pyi",
+  std::vector<std::pair<std::string, bool>> cythonFilesWithTypeContext{
+      {"types.pyx", false},
+      {"types.pxd", true},
+      {"types.pyi", true},
   };
 
   std::vector<std::string> cythonFilesNoTypeContext{
@@ -1548,33 +1568,32 @@ void t_mstch_py3_generator::generate_types() {
         "__init__.py", FileType::TypesFile, generateRootPath_);
   }
   if (has_option("inplace_migrate")) {
-    generate_mstch_file(
+    generate_whisker_file(
         "types_inplace_FBTHRIFT_ONLY_DO_NOT_USE.py",
         FileType::TypesFile,
         generateRootPath_);
   }
   for (const auto& file : converterFiles) {
-    generate_mstch_file(file, FileType::NotTypesFile, generateRootPath_);
+    generate_whisker_file(file, FileType::NotTypesFile, generateRootPath_);
   }
   // - if auto_migrate is present, generate types.pxd, and types.py
   // - else, just generate normal cython files
   for (const auto& file : autoMigrateFilesWithTypeContext) {
-    generate_mstch_file(file, FileType::TypesFile, generateRootPath_);
+    generate_whisker_file(file, FileType::TypesFile, generateRootPath_);
   }
   for (const auto& file : autoMigrateFilesNoTypeContext) {
-    generate_mstch_file(file, FileType::NotTypesFile, generateRootPath_);
+    generate_whisker_file(file, FileType::NotTypesFile, generateRootPath_);
   }
-  for (const auto& file : cythonFilesWithTypeContext) {
-    generate_mstch_file(file, FileType::TypesFile, generateRootPath_);
-  }
+  generate_mixed_template_list(
+      cythonFilesWithTypeContext, FileType::TypesFile, generateRootPath_);
   for (const auto& file : cppFilesWithTypeContext) {
-    generate_mstch_file(file, FileType::TypesFile);
+    generate_whisker_file(file, FileType::TypesFile);
   }
   for (const auto& file : cythonFilesNoTypeContext) {
-    generate_mstch_file(file, FileType::NotTypesFile, generateRootPath_);
+    generate_whisker_file(file, FileType::NotTypesFile, generateRootPath_);
   }
   for (const auto& file : cppFilesWithNoTypeContext) {
-    generate_mstch_file(file, FileType::NotTypesFile);
+    generate_whisker_file(file, FileType::NotTypesFile);
   }
 }
 
@@ -1620,16 +1639,16 @@ void t_mstch_py3_generator::generate_services() {
   // - if auto_migrate isn't present, just generate all the normal files
 
   for (const auto& file : pythonFiles) {
-    generate_mstch_file(file, FileType::NotTypesFile, generateRootPath_);
+    generate_whisker_file(file, FileType::NotTypesFile, generateRootPath_);
   }
   for (const auto& file : normalCythonFiles) {
-    generate_mstch_file(file, FileType::NotTypesFile, generateRootPath_);
+    generate_whisker_file(file, FileType::NotTypesFile, generateRootPath_);
   }
   for (const auto& file : cppFiles) {
-    generate_mstch_file(file, FileType::NotTypesFile);
+    generate_whisker_file(file, FileType::NotTypesFile);
   }
   for (const auto& file : cythonFiles) {
-    generate_mstch_file(file, FileType::NotTypesFile, generateRootPath_);
+    generate_whisker_file(file, FileType::NotTypesFile, generateRootPath_);
   }
 }
 

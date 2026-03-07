@@ -223,3 +223,23 @@ function server_uptime(): int;
 function server_process_start_time(): int;
 
 }
+
+namespace HH\Experimental {
+
+/**
+ * Pass thread hint to hhvm thread scheduler to influence scheduling decisions.
+ *
+ * EXPERIMENTAL: This API is subject to change or removal.
+ */
+<<__Native>>
+function enable_thread_hint(int $hint = 0): void;
+
+/**
+ * Stop hinting to the hhvm thread scheduler to influence scheduling decisions.
+ *
+ * EXPERIMENTAL: This API is subject to change or removal.
+ */
+<<__Native>>
+function disable_thread_hint(int $hint = 0): void;
+
+} // namespace HH\Experimental
